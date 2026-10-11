@@ -1,0 +1,76 @@
+name: ML-DSA TLS benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (x86: ubuntu-24.04 | Arm: ubuntu-24.04-arm)"
+        default: "ubuntu-24.04"
+      openssl_version:
+        description: "OpenSSL version to build (must be >= 3.5)"
+        default: "3.5.7"
+      repetitions:
+        description: "Handshakes per case"
+        default: "200"
+      required_cpu:
+        description: "Fail early unless the CPU model contains this text (blank = accept any). Z-NOC host in the paper: 9V45"
+        default: "9V45"
+
+jobs:
+  bench:
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: debian:trixie          # Debian GNU/Linux 13 user space, as in the paper
+    steps:
+      - name: Install packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential perl curl ca-certificates git python3 util-linux procps
+
+      - uses: actions/checkout@v4
+
+      - name: Record host (CPU, kernel, memory)
+        id: host
+        run: |
+          {
+            echo "### Host"
+            echo '```'
+            lscpu | grep -E "Model name|Architecture|^CPU\(s\)"
+            echo "Kernel: $(uname -r)"
+            grep MemTotal /proc/meminfo
+            cat /etc/debian_version | sed 's/^/Debian: /'
+            echo '```'
+          } | tee host.txt >> "$GITHUB_STEP_SUMMARY"
+          cat host.txt
+          REQ="${{ inputs.required_cpu }}"
+          if [ -n "$REQ" ] && ! lscpu | grep "Model name" | grep -q "$REQ"; then
+            echo "::error::CPU is not '$REQ'. Re-run the workflow until you get the same CPU as the Z-NOC host."
+            exit 1
+          fi
+
+      - name: Build OpenSSL ${{ inputs.openssl_version }}
+        run: |
+          V="${{ inputs.openssl_version }}"
+          mkdir -p /opt/src && cd /opt/src
+          curl -fsSL -o o.tgz "https://github.com/openssl/openssl/releases/download/openssl-$V/openssl-$V.tar.gz"
+          tar xzf o.tgz && cd "openssl-$V"
+          ./Configure --prefix=/opt/openssl --libdir=lib no-docs no-tests
+          make -j"$(nproc)"
+          make install_sw
+          mkdir -p /opt/openssl/ssl && cp apps/openssl.cnf /opt/openssl/ssl/openssl.cnf
+          LD_LIBRARY_PATH=/opt/openssl/lib /opt/openssl/bin/openssl version
+
+      - name: Run benchmark
+        env:
+          OPENSSL: /opt/openssl/bin/openssl
+          LD_LIBRARY_PATH: /opt/openssl/lib
+        run: |
+          python3 mldsa_bench.py "${{ inputs.repetitions }}" | tee results.txt
+          { echo "### Results"; echo '```'; cat results.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mldsa-results
+          path: |
+            results.txt
+            host.txt
